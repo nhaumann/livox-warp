@@ -1,0 +1,5 @@
+# Line endings: LF in the repository and in every checkout, so a Windows and a Linux clone diff clean.
+* text=auto eol=lf
+*.png binary
+*.lvxr binary
+*.bin binary

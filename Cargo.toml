@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/livox", "crates/livox-cli", "crates/livox-py"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# clap 4.6 needs 1.85; `usize::is_multiple_of` (used in the point decoder) needs 1.87.
+rust-version = "1.87"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/nhaumann/livox-warp"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

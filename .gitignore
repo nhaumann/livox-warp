@@ -1,0 +1,30 @@
+# Build outputs
+/target/
+/python/livox_warp/_native.pyd
+/python/livox_warp/_native*.so
+/python/livox_warp/_native*.dylib
+/dist/
+/build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Per-user runtime state and exports written next to the checkout
+imgui.ini
+/livox_*.png
+/livox_*.ply
+/livox_*.las
+/shot_*.png
+*.log
+
+# Data: recordings and prior maps are large and personal; firmware images are Livox's
+/recordings/*.lvxr
+/maps/
+/firmware/
+
+# Editor and tool state
+/.blender-toolkit/
+/.idea/
+/.vscode/

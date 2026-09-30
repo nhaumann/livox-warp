@@ -1,0 +1,15 @@
+[package]
+name = "livox"
+description = "Livox SDK1 protocol (Mid-40/70, Horizon, Tele-15, Avia): discovery, control, point streaming"
+keywords = ["lidar", "livox", "point-cloud", "udp"]
+categories = ["hardware-support", "network-programming", "science::robotics"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[dependencies]
+socket2 = "0.6"
+if-addrs = "0.15"

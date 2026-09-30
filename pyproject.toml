@@ -1,0 +1,54 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "livox-warp"
+version = "0.1.0"
+description = "Livox LiDAR viewer with a native Rust protocol stack and an NVIDIA Warp GPU pipeline: SLAM, perception and prior-map localisation for the Mid-40"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["lidar", "livox", "warp", "slam", "point-cloud", "cuda"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "warp-lang>=1.12",
+    "pyglet>=2.1",
+    "imgui[pyglet]>=2.0",
+    "moderngl>=5.10",
+    "laspy>=2.5",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+prior-map = ["open3d>=0.18", "pye57>=0.4"]
+
+[project.scripts]
+livox-warp = "livox_warp.app:main"
+
+[project.urls]
+Repository = "https://github.com/nhaumann/livox-warp"
+
+[tool.maturin]
+python-source = "python"
+module-name = "livox_warp._native"
+manifest-path = "crates/livox-py/Cargo.toml"
+python-packages = ["livox_warp", "warp_worker"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["python/warp_worker"]  # vendored unmodified; see python/warp_worker/VENDORED.md
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

@@ -1,0 +1,18 @@
+[package]
+name = "livox-py"
+description = "Python bindings (livox_warp._native) for the livox crate"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lib]
+name = "livox_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+livox = { path = "../livox" }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
