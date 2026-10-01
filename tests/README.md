@@ -6,7 +6,8 @@ timings (exit status 1 if anything failed); `python tests/run_all.py check_odome
 subset.
 
 The simulated checks (`check_odometry`, `check_slam_worker`, `check_perception`, `check_mid40_dual`,
-`smoke_pipeline`) need no data. The others use recordings and a prior map that you supply through the
+`check_remote`, `check_rosette`, `check_walkfit`, `check_occupancy`, `check_refine`, `smoke_pipeline`) need no
+data. The others use recordings and a prior map that you supply through the
 environment; a script whose data is absent prints `SKIP: ...` and exits 0. `benchmarks/` holds the
 scripts that measure rather than gate, `tools/` the calibration tool; both read the same data.
 
@@ -29,10 +30,14 @@ How to create each:
 - recordings: in the viewer (LiDAR > Recording) or with the CLI,
   `livox stream --lidar <lidar-ip> --secs 10 --record recordings/run.lvxr`
 - the prior map: `python -m livox_warp.prior_map convert scan.e57 --voxel 0.02 --out maps/prior_20mm.npz`
+  (`python -m livox_warp.prior_map stations maps/prior_20mm.npz` adds the scanner stations to an older cache:
+  from the E57's scan poses with `--e57`, else estimated from the scan's point density)
 - the poses: `python -m livox_warp.localize maps/prior_20mm.npz recordings/*static*.lvxr`
   (writes `maps/recording_poses.npz`; each recording must start with the scanner standing still inside
   the mapped area)
-- the walk reference: written by whoever generates it (`ref`, `fit`, `trusted_until` as above)
+- the walk reference: `python -m livox_warp.refine recordings/<walk>.lvxr --map maps/prior_20mm.npz --out
+  out/walk` writes `out/walk/trajectory.npz` with `ref`, `fit` and `trusted_until` (copy it to
+  `maps/walk_reference.npz`), or any other source with those three arrays
 
 ## Environment
 
@@ -58,10 +63,14 @@ How to create each:
 | `tests/check_perception.py`     | none; real-data part: a static recording, its pose and the prior map  |
 | `tests/check_prior_map.py`      | the prior map and a static recording; step 3: the walk and reference  |
 | `tests/smoke_pipeline.py`       | none; replay part: any recording                                      |
+| `tests/check_rosette.py`        | none; reader and real-pattern part: any recording                     |
+| `tests/check_refine.py`         | none; real part: the walk and the prior map (writes `out/refine/`)    |
 | `benchmarks/bench_neighbors.py` | any recording                                                         |
 | `benchmarks/bench_prior_map.py` | the prior map and the walk (`--reference` for the comparison)         |
 | `tools/calib_prior_map.py`      | the prior map and static recordings                                   |
 
 `tests/common.py` resolves all of this (`static_recordings()`, `prior_map()`, `skip()`, ...) and holds the
-helpers the scripts share: the `View` / `Shade` builders, recording replay to numpy, and the frame loop that
-drives a `PriorSession` with the odometry worker the way the viewer does.
+helpers the scripts share: the `View` / `Shade` builders, recording replay to numpy, the frame loop that
+drives a `PriorSession` with the odometry worker the way the viewer does, and the simulated changes the solvers
+are tested on (a terrestrial scan of the office with a box since removed, a walk through it with a box since
+added).

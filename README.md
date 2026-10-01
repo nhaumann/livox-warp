@@ -54,15 +54,16 @@ livox-warp --replay recordings\run.lvxr --speed 2
 livox-warp --sim                   # Warp-simulated Mid-40, no hardware
 livox-warp --sim --sim-motion walk --sim-scene office --odom --ground --clusters
 livox-warp --prior-map maps\prior_20mm.npz --odom --color changes
+livox-warp --remote --odom         # watch and reset SLAM from a phone (see Phone link)
 livox-warp --help                  # every option
 ```
 
 Close Livox Viewer first: it binds UDP 55000 to one address, which hides the LiDAR's broadcasts.
 
-The viewer mount pose (View > Mount pose, e.g. roll 180 for a scanner used upside down) is the one
-setting remembered between runs, in `%APPDATA%\livox-warp\viewer.json` (`~/.config/livox-warp` on
-Linux); `--config PATH` uses another file. Everything else starts from its default or its command
-line flag.
+The viewer mount pose (View > Mount pose, e.g. roll 180 for a scanner used upside down) and the phone
+link's key are the settings remembered between runs, in `%APPDATA%\livox-warp\viewer.json`
+(`~/.config/livox-warp` on Linux); `--config PATH` uses another file. Everything else starts from its
+default or its command line flag.
 
 ## What you control that Livox Viewer doesn't let you
 
@@ -182,6 +183,77 @@ localises in 0.7 s within 0.5 cm / 0.13 deg of a 3-minute exhaustive search; 86%
 the scan and 8% are new (a railing and objects added since). On a handheld walk the corrected poses
 are within 2.0 cm (median, 4.9 cm p90) of a frame-by-frame scan registration wherever that
 registration is solid.
+
+### Phone link: watch and reset SLAM from a phone
+
+```
+livox-warp --remote --odom         # or View > Phone link > Start phone link; --remote PORT, default 8765
+```
+
+The View panel shows a QR code of the link; scan it with a phone on the same network. The page draws
+the cloud itself with WebGL2, so orbiting with a finger stays smooth whatever the Wi-Fi does, and it
+shows what the viewer shows, in its colours: the live window or the integration map, the odometry path
+and the scanner's viewing cone. The top bar has the SLAM state (tracking or weak geometry, rms, speed)
+and the prior map's; the buttons reset SLAM (two taps), turn odometry and the map on and off, follow
+the scanner, pick the colours and the points per snapshot, re-localise in the prior map, and pause and
+resume the LiDAR's sampling.
+
+- **Snapshots, not video.** A Warp kernel thins the shaded cloud to the phone's budget (100k to 600k
+  points) and packs it as 1 cm int16 positions and RGB, 9 bytes a point. The copy to the host goes
+  through pinned memory and is waited for with an event, so the render thread never stalls on it. A
+  phone gets the next snapshot only after acknowledging the last one, at most 10 a second and 40 Mbit/s.
+- **A key in the link.** The WebSocket opens only with the key from the link. It is kept in the config
+  file, so a bookmarked link keeps working; View > Phone link > New key revokes it. The page is plain
+  HTTP for the local network: don't forward the port to the internet.
+- On a computer with more than one network, pick the address the phone is on in the panel. On Windows,
+  allow Python through the firewall for private networks when asked.
+
+### Refining a recording: scan pattern, continuous-time trajectory, occupancy
+
+```
+python -m livox_warp.refine recordings\walk.lvxr --map maps\prior_20mm.npz --out out\walk
+```
+
+Offline, three differentiable solvers fit a whole recording against the prior map, each feeding the others:
+
+- **Scan pattern** (`rosette.py`). The Mid-40's two wedge prisms draw a rosette; its model (the two prism
+  rates, a few harmonics of their phases, a slow phase wander) is fitted to the recording's own firing
+  directions in float64 (`lvxr.py` reads every firing with its exact time, the empty ones included). It gives the
+  prism phases of every point, the direction of every firing that returned nothing, and a simulator that scans
+  like this unit (`SimSource(rosette=...)`).
+- **Continuous-time trajectory** (`walkfit.py`). One B-spline trajectory for the whole recording, every point
+  placed by the pose at its own firing time and pulled onto the scan (point-to-plane, annealed robust loss),
+  differentiated with `wp.Tape` and stepped with Adam. It starts from the odometry placed by the global
+  localisation, works through the recording in overlapping windows (re-anchoring a window by registration if
+  it starts far off), and also fits a range offset per return and an angular distortion over the prism phases.
+- **Occupancy** (`occupancy.py`). A density field trained on the fitted rays by their Beer-Lambert likelihood
+  (free space up to a return, the ray stopping around it), warm-started from the scan. A dual-return firing is
+  two sub-rays, so an edge or a railing settles at partial occupancy; a firing that returned nothing argues for
+  free space along the rosette's direction. It classifies what changed since the scan (added, removed,
+  transient) and masks those points out of a second trajectory fit.
+
+The output is a reference trajectory for the whole walk (the format `benchmarks/bench_prior_map.py --reference`
+reads), the calibration, the occupancy field and the changes as a PLY. Telling a new surface from one the scan
+never saw needs the scanner's stations: from the E57's scan poses, or, for a merged E57 that kept none,
+estimated from the scan's point density (a scanner's samples pile up on the floor and ceiling around it;
+`python -m livox_warp.prior_map stations map.npz` saves them). `tests/check_rosette.py`, `check_walkfit.py`,
+`check_occupancy.py` and `check_refine.py` test each solver and the chain against simulated ground truth,
+gradients included.
+
+What it found on our Mid-40, a 90 s handheld walk and the building scan (about a minute end to end):
+
+- **The scan pattern.** The prisms turn at +121.64 Hz and -77.78 Hz, each deflecting 9.6-9.8 deg, about a centre
+  0.62 deg off the optical axis, with some twenty smaller harmonics, conjugate terms such as (-2, -1) among them
+  (the prisms are not thin). Each prism's phase wanders by several radians over 90 s against its mean rate, so
+  the pattern is tracked, not predicted; tracked, it explains every firing's direction to 0.4 mrad.
+- **A whole-walk reference.** Fitted against the scan, the median 0.1 s frame has 98% of its points within 3 cm
+  of it, and the reference holds to 85 s (the frame-by-frame one stopped at 54 s; the last seconds look past the
+  scanned area). Against it, the viewer's SLAM is 2-7 cm off for the first 55 s, about a metre off from 55 to
+  65 s (the flat wall where it loses track) and back within 2-5 cm after, once the drift correction re-finds it.
+- **Calibration.** Second returns measure 0.3 cm shorter than first returns on the walk's surfaces. The angles
+  come out 1-2% narrower than the sensor reports (the walk fit says 2%, registering static recordings says
+  about 1%): a lead to follow, not yet a correction to apply. A single range offset on every return cannot be
+  measured this way: for a 38 deg cone it is all but a move along the optical axis.
 
 ## Keys
 
