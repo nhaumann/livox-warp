@@ -174,7 +174,9 @@ livox-warp --prior-map maps\prior_20mm.npz [--odom]
   result fits, moved it by less than 0.5 m / 5 deg, and either is a small step or fits clearly better
   than before (facing one wall, a registration can slide along it with no change in fit). Three poor
   fits in a row mark the pose lost; the last pose is then re-tried from nearby starts before a new
-  global search, and a global answer far from where the scanner last fitted is ignored.
+  global search, and a global answer far from where the scanner last fitted is ignored. Tracking takes
+  its second of points up to the odometry's newest frame, so an odometry running behind under load
+  delays the corrections instead of stopping them.
 - **Changes colours.** Every visible point is coloured by its distance to the scan: green within
   3 cm, amber within 10 cm, red beyond (new or moved). The scan can be drawn, dimmed, for context.
 
@@ -195,8 +197,8 @@ the cloud itself with WebGL2, so orbiting with a finger stays smooth whatever th
 shows what the viewer shows, in its colours: the live window or the integration map, the odometry path
 and the scanner's viewing cone. The top bar has the SLAM state (tracking or weak geometry, rms, speed)
 and the prior map's; the buttons reset SLAM (two taps), turn odometry and the map on and off, follow
-the scanner, pick the colours and the points per snapshot, re-localise in the prior map, and pause and
-resume the LiDAR's sampling.
+the scanner, pick the colours and the points per snapshot, re-localise in the prior map, pause and resume
+the LiDAR's sampling, and start and stop a recording (the walk in hand, the phone in the other).
 
 - **Snapshots, not video.** A Warp kernel thins the shaded cloud to the phone's budget (100k to 600k
   points) and packs it as 1 cm int16 positions and RGB, 9 bytes a point. The copy to the host goes
@@ -224,13 +226,15 @@ Offline, three differentiable solvers fit a whole recording against the prior ma
 - **Continuous-time trajectory** (`walkfit.py`). One B-spline trajectory for the whole recording, every point
   placed by the pose at its own firing time and pulled onto the scan (point-to-plane, annealed robust loss),
   differentiated with `wp.Tape` and stepped with Adam. It starts from the odometry placed by the global
-  localisation, works through the recording in overlapping windows (re-anchoring a window by registration if
+  localisation (of the first 1.5 s at rest, or, if that view is ambiguous, of the odometry's own map of the
+  first 5 to 40 s), works through the recording in overlapping windows (re-anchoring a window by registration if
   it starts far off), and also fits a range offset per return and an angular distortion over the prism phases.
 - **Occupancy** (`occupancy.py`). A density field trained on the fitted rays by their Beer-Lambert likelihood
   (free space up to a return, the ray stopping around it), warm-started from the scan. A dual-return firing is
   two sub-rays, so an edge or a railing settles at partial occupancy; a firing that returned nothing argues for
-  free space along the rosette's direction. It classifies what changed since the scan (added, removed,
-  transient) and masks those points out of a second trajectory fit.
+  free space along the rosette's direction. Frames the trajectory fit did not place (under half their points
+  within 3 cm) add no rays: theirs would cross floors and walls that are there. It classifies what changed
+  since the scan (added, removed, transient) and masks those points out of a second trajectory fit.
 
 The output is a reference trajectory for the whole walk (the format `benchmarks/bench_prior_map.py --reference`
 reads), the calibration, the occupancy field and the changes as a PLY. Telling a new surface from one the scan
@@ -250,10 +254,17 @@ What it found on our Mid-40, a 90 s handheld walk and the building scan (about a
   of it, and the reference holds to 85 s (the frame-by-frame one stopped at 54 s; the last seconds look past the
   scanned area). Against it, the viewer's SLAM is 2-7 cm off for the first 55 s, about a metre off from 55 to
   65 s (the flat wall where it loses track) and back within 2-5 cm after, once the drift correction re-finds it.
-- **Calibration.** Second returns measure 0.3 cm shorter than first returns on the walk's surfaces. The angles
-  come out 1-2% narrower than the sensor reports (the walk fit says 2%, registering static recordings says
-  about 1%): a lead to follow, not yet a correction to apply. A single range offset on every return cannot be
-  measured this way: for a 38 deg cone it is all but a move along the optical axis.
+- **Calibration.** The angles come out 1.2-2.0% narrower than the sensor reports, in two walks and across
+  runs, and registering static recordings says about 1%: consistent, but not yet a correction to apply. The
+  second returns' offset from the first is not stable (-0.3 to +1.6 cm between runs): too small to calibrate
+  this way. A single range offset on every return cannot be measured from a walk at all: for a 38 deg cone it
+  is all but a move along the optical axis.
+- **A trap: both sides of a floor.** Our scan holds the floor seen from above and, 20-30 cm below it, the
+  basement ceiling seen from below. On a second walk (141 s, mostly in one room, looking down at the floor),
+  two stretches of the fitted trajectory came out 25 cm low with their floor on the basement ceiling: the
+  walls in view cannot tell a vertical shift, and the fit to the scan still reads high. The occupancy then
+  marks that room's floor as removed. A return should only match a surface that faces it; the scan's normals
+  are not oriented yet, so treat a refine's heights with care where a floor is all that fixes them.
 
 ## Keys
 

@@ -196,6 +196,7 @@ def viewer():
                         state["frames"] = st["odom"]["frames"] if st["odom"] else 0
                         state["color"] = st["color"]
                         assert st["sampling"] is None, "the simulator reported LiDAR sampling"
+                        assert st["recording"] is None, "the simulator offered recording"
 
                 pump(60.0, lambda: state["frames"] >= 40 and state["snapshots"] >= 5)
                 assert state["frames"] >= 40, f"odometry frames stuck at {state['frames']}"

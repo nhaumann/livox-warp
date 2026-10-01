@@ -313,11 +313,13 @@ def wait_ready(session, timeout: float = 300.0):
 
 
 def drive(session, x, a, t, worker=None, pipe=None, on_frame=None, on_batch=None, batch: int = 2000,
-          frame_dt: float = 0.1, wait: float = 5.0) -> np.ndarray:
+          frame_dt: float = 0.1, wait: float = 5.0, backlog: int = 2) -> np.ndarray:
     """Feed a recording through a PriorSession, and through an OdomWorker on `pipe` if given, the way the
     viewer's frame loop does. The session schedules on sensor time; after each batch its job is waited for
-    (at most `wait` s: live, the worker keeps up). on_frame(result, session) runs per odometry frame with
-    the worker's FrameResult, on_batch(now, session) after each batch. Returns the last odometry pose."""
+    (at most `wait` s: live, the worker keeps up), and so is the odometry, until at most `backlog` batches
+    are queued: live the sensor's pace keeps it caught up, and a replay that ran ahead would make it drop
+    batches. on_frame(result, session) runs per odometry frame with the worker's FrameResult,
+    on_batch(now, session) after each batch. Returns the last odometry pose."""
     odom = worker is not None
     T_now = np.eye(4)
     for i in range(0, len(t), batch):
@@ -327,12 +329,17 @@ def drive(session, x, a, t, worker=None, pipe=None, on_frame=None, on_batch=None
         if odom:
             sx, sa, st, _ = pipe.stage(xs, as_, ts, n, 1.0 / frame_dt)
             worker.submit(sx, sa, st, n, float(ts.min()), float(ts.max()))
-            for r in worker.poll():
-                session.add_frame(r.k, r.T, r.xi)
-                T_now = r.T
-                if on_frame is not None:
-                    on_frame(r, session)
-            worker.release_consumed()
+            deadline = time.perf_counter() + wait
+            while True:
+                for r in worker.poll():
+                    session.add_frame(r.k, r.T, r.xi)
+                    T_now = r.T
+                    if on_frame is not None:
+                        on_frame(r, session)
+                worker.release_consumed()
+                if worker.status()["pending"] <= backlog or time.perf_counter() > deadline:
+                    break
+                time.sleep(0.002)
         now = float(ts.max())
         session.tick(now, T_now, odom)
         deadline = time.perf_counter() + wait

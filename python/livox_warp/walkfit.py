@@ -620,9 +620,13 @@ class WalkFit:
 
     # ---- what the other solvers take ------------------------------------------------------------------
 
-    def rays(self, xyz, attr, t, miss_t=None, miss_dir=None, miss_weight: float = 0.2):
+    def rays(self, xyz, attr, t, miss_t=None, miss_dir=None, miss_weight: float = 0.2, min_fit: float = 0.0,
+             frame_dt: float = 0.1):
         """World rays of points (sensor-frame xyz, attr, float64 t) and, optionally, of firings that returned nothing
-        (times, sensor-frame unit directions): device arrays (origin, direction, range, weight) for occupancy.py."""
+        (times, sensor-frame unit directions): device arrays (origin, direction, range, weight) for occupancy.py.
+        Rays of a frame (frame_dt) with less than min_fit of its points within 3 cm of the scan weigh nothing: where
+        the fit could not place the sensor, its rays cross floors and walls that are there, and the occupancy would
+        read them as removed."""
         echo = ((np.asarray(attr, dtype=np.uint32) >> 16) & 0xFF).astype(np.int32)
         pts = self._points(xyz, echo, t)
         n_p = pts.n
@@ -634,6 +638,18 @@ class WalkFit:
             mp = self._points(np.asarray(miss_dir, np.float32), np.zeros(n_m, np.int32), miss_t)
             self._launch_rays(mp, 1, n_p, out)
             w[n_p:] = miss_weight
+        if min_fit > 0.0:
+            k0 = int(math.floor(self.t_first / frame_dt))
+            k1 = int(math.floor(self.t_last / frame_dt))
+            c = self.fit_fractions(k0 * frame_dt, (k1 + 1) * frame_dt, frame_dt)
+            poor = c[:, 1] < min_fit * np.maximum(c[:, 0], 1)
+
+            def frame(tt):
+                return np.clip(np.floor(np.asarray(tt, np.float64) / frame_dt).astype(np.int64) - k0, 0, len(c) - 1)
+
+            w[:n_p][poor[frame(t)]] = 0.0
+            if n_m:
+                w[n_p:][poor[frame(miss_t)]] = 0.0
         return out[0], out[1], out[2], wp.array(w, dtype=float, device=self.device)
 
     def frame_reference(self, frame_dt: float = 0.1):

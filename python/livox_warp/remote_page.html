@@ -52,6 +52,7 @@
   button.danger { background: rgba(255, 90, 77, 0.16); color: #ffb3ac; border-color: rgba(255, 90, 77, 0.4); }
   button.armed { background: var(--bad); color: #fff; }
   button.paused { background: var(--warn); color: #2b1d00; border-color: transparent; }
+  button.rec { background: var(--bad); color: #fff; border-color: transparent; }
   button:disabled { opacity: 0.4; }
   #msg {
     position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: 80%; padding: 16px 20px;
@@ -63,7 +64,7 @@
 <body>
 <canvas id="view"></canvas>
 <div id="top">
-  <div class="row"><span id="link" class="dot"></span><span id="source">connecting</span><span id="paused" class="chip warn" hidden>paused</span></div>
+  <div class="row"><span id="link" class="dot"></span><span id="source">connecting</span><span id="paused" class="chip warn" hidden>paused</span><span id="rec" class="chip bad" hidden></span></div>
   <div class="row"><span id="slam" class="chip">SLAM off</span><span id="slamDetail" class="dim"></span></div>
   <div class="row" id="priorRow" hidden><span id="prior" class="chip"></span><span id="priorDetail" class="dim"></span></div>
   <div class="row dim" id="rate"></div>
@@ -71,6 +72,7 @@
 <div id="bar">
   <button id="reset" class="danger">Reset SLAM</button>
   <button id="sampling" hidden>Pause LiDAR</button>
+  <button id="record" hidden>Record</button>
   <button id="odom">SLAM</button>
   <button id="mapMode">Map</button>
   <button id="follow" class="on">Follow</button>
@@ -462,6 +464,12 @@ function setChip(el, text, level) {
 }
 
 let sampling = null;  // the LiDAR's point output: true, false, or null when the source is not a LiDAR
+let recording = null;  // seconds into the current recording, false when not recording, null without a LiDAR
+
+function clock(seconds) {
+  const s = Math.floor(seconds);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
 
 function onStatus(st) {
   $("source").textContent = st.source || "no source";
@@ -470,6 +478,12 @@ function onStatus(st) {
   $("sampling").textContent = sampling === false ? "Resume LiDAR" : "Pause LiDAR";
   $("sampling").classList.toggle("paused", sampling === false);
   $("paused").hidden = sampling !== false;
+  recording = st.recording ?? null;
+  $("record").hidden = recording === null;
+  $("record").textContent = recording === false ? "Record" : `Stop ${clock(recording)}`;
+  $("record").classList.toggle("rec", recording !== false && recording !== null);
+  $("rec").hidden = recording === false || recording === null;
+  if (typeof recording === "number") $("rec").textContent = `REC ${clock(recording)}`;
   const secs = snapshots.length > 1 ? (snapshots.at(-1)[0] - snapshots[0][0]) / 1000 : 0;
   const hz = secs > 0 ? (snapshots.length - 1) / secs : 0;
   const mbps = secs > 0 ? snapshots.slice(1).reduce((s, [, b]) => s + b, 0) * 8 / secs / 1e6 : 0;
@@ -541,6 +555,12 @@ $("sampling").addEventListener("click", () => {
   send({ cmd: "sampling", on: !sampling });
   $("sampling").disabled = true;  // the LiDAR takes a moment to answer; the next status shows its state
   setTimeout(() => { $("sampling").disabled = false; }, 1500);
+});
+$("record").addEventListener("click", () => {
+  send({ cmd: "record", on: recording === false });
+  if (navigator.vibrate) navigator.vibrate(recording === false ? [30, 60, 30] : 40);
+  $("record").disabled = true;  // the next status shows whether it started
+  setTimeout(() => { $("record").disabled = false; }, 1500);
 });
 $("odom").addEventListener("click", () => send({ cmd: "odometry", on: !$("odom").classList.contains("on") }));
 $("mapMode").addEventListener("click", () => send({ cmd: "map", on: !$("mapMode").classList.contains("on") }));

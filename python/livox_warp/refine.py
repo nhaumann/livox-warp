@@ -5,8 +5,9 @@
 The three solvers feed one another (rosette.py, walkfit.py, occupancy.py):
   1. every firing of the recording (lvxr.py), and the scan pattern fitted to them: the prism phases of every
      point, and the directions of the firings that returned nothing;
-  2. a starting trajectory: the odometry over the recording, placed in the map by a global localisation of its
-     first 1.5 s (the recording must start at rest inside the mapped area);
+  2. a starting trajectory: the odometry over the recording, placed in the map by a global localisation: of the
+     first 1.5 s at rest, or, where that view is ambiguous, of the odometry's own map over the first 5, 10, 20
+     or 40 s (a bigger piece of the building is far less ambiguous, and over that long the odometry holds);
   3. the trajectory fitted to the scan;
   4. the occupancy field from those rays and the empty firings, warm-started from the scan; what changed;
   5. the trajectory fitted again with the changes left out and the calibration free (a range offset per return,
@@ -29,7 +30,7 @@ from dataclasses import replace
 import numpy as np
 import warp as wp
 
-from . import export, gpu, localize, lvxr, occupancy, prior_map, rosette, walkfit
+from . import dmath, export, gpu, localize, lvxr, occupancy, prior_map, rosette, walkfit
 from .odom import Odometry
 
 FINE_STAGES = (walkfit.Stage(0.06, 0.15, 60, 2e-3, 3e-4), walkfit.Stage(0.03, 0.08, 80, 8e-4, 1.2e-4),
@@ -37,6 +38,9 @@ FINE_STAGES = (walkfit.Stage(0.06, 0.15, 60, 2e-3, 3e-4), walkfit.Stage(0.03, 0.
 CHANGE_COLOURS = {occupancy.ADDED: (255, 64, 48), occupancy.REMOVED: (64, 128, 255),
                   occupancy.TRANSIENT: (255, 190, 60)}
 MAX_MISSES = 2_000_000
+# a frame whose points fit the scan less than this (within 3 cm) adds no rays to the occupancy: the fit did not place
+# it, and its rays would cross the floor and walls that are there and read them as removed
+RAY_MIN_FIT = 0.5
 
 
 def odometry_trajectory(xyz, attr, t, device, frame_dt: float = 0.1, batch: int = 2000):
@@ -62,6 +66,28 @@ def odometry_trajectory(xyz, attr, t, device, frame_dt: float = 0.1, batch: int 
     if len(odom.traj) < 2:
         raise RuntimeError("the odometry produced no trajectory")
     return np.array([tm for _, tm, _ in odom.traj]), np.array([T for _, _, T in odom.traj])
+
+
+def place_in_map(loc, xyz, t, times, poses_w, spans=(5.0, 10.0, 20.0, 40.0), max_points: int = 400_000):
+    """T_MW, the odometry's world in the map, with the search's diagnostics and the seconds it took: the first 1.5 s
+    at rest (the odometry's world is the first frame), else the odometry's own map over growing spans."""
+    T, info = loc.search(xyz[t < t[0] + 1.5], log=lambda s: None)
+    if info["unique"]:
+        return T, info, 1.5
+    tried = [f"1.5 s: {info['inliers']:.2f} vs {info['runner_up']:.2f}"]
+    for span in spans:
+        idx = np.flatnonzero(t < t[0] + span)
+        idx = idx[::max(1, len(idx) // max_points)]
+        Tp = dmath.interpolate_poses(times, poses_w, t[idx])
+        w = np.einsum("nij,nj->ni", Tp[:, :3, :3], xyz[idx]) + Tp[:, :3, 3]
+        T, info = loc.search(w.astype(np.float32), log=lambda s: None)
+        if info["unique"]:
+            return T, info, span
+        tried.append(f"{span:g} s: {info['inliers']:.2f} vs {info['runner_up']:.2f}")
+        if span >= t[-1] - t[0]:
+            break
+    raise RuntimeError("the recording does not localise uniquely in the map (inliers vs the best elsewhere: "
+                       + "; ".join(tried) + "): does it start inside the mapped area?")
 
 
 def miss_rays(fir: lvxr.Firings, ros: rosette.RosetteModel, cap: int = MAX_MISSES, seed: int = 0):
@@ -115,13 +141,12 @@ def refine(recording: str, map_path: str, out_dir: str, device=None, seconds: fl
             "(python -m livox_warp.prior_map stations map.npz saves them)")
     report["stations"] = int(len(stations))
     del pm
-    T_M0, info = loc.search(xyz[t < t[0] + 1.5], log=lambda s: None)
-    if not info["unique"]:
-        raise RuntimeError(f"the first 1.5 s do not localise uniquely (inliers {info['inliers']:.2f}, runner-up "
-                           f"{info['runner_up']:.2f}): does the recording start at rest inside the mapped area?")
     times, poses_w = odometry_trajectory(xyz, attr, t, dev, frame_dt)
-    init = T_M0[None] @ poses_w
-    log(f"start localised (inliers {info['inliers']:.2f} within 3 cm); odometry: {len(times)} frames")
+    T_MW, info, span = place_in_map(loc, xyz, t, times, poses_w)
+    init = T_MW[None] @ poses_w
+    report["placed_from_s"] = span
+    log(f"odometry: {len(times)} frames; placed in the map from the first {span:g} s (inliers {info['inliers']:.2f} "
+        f"within 3 cm, runner-up elsewhere {info['runner_up']:.2f})")
     stamp("initial_trajectory", t0)
 
     # 3. the trajectory against the scan
@@ -134,7 +159,8 @@ def refine(recording: str, map_path: str, out_dir: str, device=None, seconds: fl
 
     # 4. occupancy from those rays; what changed
     t0 = time.perf_counter()
-    o, d, r, w = fit_a.rays(xyz, attr, t, miss_t, miss_dir)
+    o, d, r, w = fit_a.rays(xyz, attr, t, miss_t, miss_dir, min_fit=RAY_MIN_FIT, frame_dt=frame_dt)
+    report["rays_left_out_first"] = float(np.mean(w.numpy() == 0.0))
     field = occupancy.OccupancyField.around(o.numpy(), d.numpy(), r.numpy(), cell, device=dev,
                                             clip=(loc.grid.lo - 0.5, loc.grid.hi + 0.5))
     field.warm_start(loc.grid, stations)
@@ -156,7 +182,8 @@ def refine(recording: str, map_path: str, out_dir: str, device=None, seconds: fl
 
     # 6. occupancy from the final rays (warm-started again from the scan, so the first pass's errors do not stay)
     t0 = time.perf_counter()
-    o, d, r, w = fit_b.rays(xyz, attr, t, miss_t, miss_dir)
+    o, d, r, w = fit_b.rays(xyz, attr, t, miss_t, miss_dir, min_fit=RAY_MIN_FIT, frame_dt=frame_dt)
+    report["rays_left_out"] = float(np.mean(w.numpy() == 0.0))
     field.warm_start(loc.grid, stations)
     field.m.zero_()
     field.v.zero_()
@@ -164,7 +191,8 @@ def refine(recording: str, map_path: str, out_dir: str, device=None, seconds: fl
     field.set_rays(o, d, r, w)
     field.train(epochs=epochs, log=log)
     report["changes"] = field.classify()
-    log(f"occupancy: {report['changes']}")
+    log(f"occupancy: {report['changes']} ({report['rays_left_out']:.0%} of the rays left out: frames the fit did not "
+        f"place)")
     stamp("occupancy_final", t0)
 
     # outputs
@@ -194,7 +222,7 @@ def refine(recording: str, map_path: str, out_dir: str, device=None, seconds: fl
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m livox_warp.refine", description=__doc__.split("\n")[0])
-    p.add_argument("recording", help="an .lvxr recording that starts at rest inside the mapped area")
+    p.add_argument("recording", help="an .lvxr recording made inside the mapped area")
     p.add_argument("--map", required=True, help="the prior map .npz (python -m livox_warp.prior_map convert)")
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--seconds", type=float, help="use only the first S seconds of the recording")

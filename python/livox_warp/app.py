@@ -279,6 +279,7 @@ class App:
         self.replay_path = args.replay or ""
         self.replay_speed = 1.0
         self.record_path = ""
+        self._rec_started = 0.0  # when the current recording started (perf_counter)
         self.sim_motion = SIM_MOTIONS.index(args.sim_motion)
         self.sim_scene = SIM_SCENES.index(args.sim_scene)
         self.ifaces = _native.local_interfaces()
@@ -929,7 +930,7 @@ class App:
             else:
                 imgui.text_colored("Mid-40: single-return stream", *GREY)
 
-        if imgui.tree_node("Recording"):
+        if imgui.tree_node("Recording", imgui.TREE_NODE_DEFAULT_OPEN):
             self._ui_recording(live)
             imgui.tree_pop()
         if imgui.tree_node("IP configuration"):
@@ -944,21 +945,35 @@ class App:
             self.record_path = os.path.join("recordings", time.strftime("lidar_%Y%m%d_%H%M%S.lvxr"))
         _, self.record_path = imgui.input_text("path", self.record_path, 512)
         if live.recording:
-            imgui.text_colored(f"recording to {live.recording}", *RED)
+            imgui.text_colored(f"recording to {live.recording} ({time.perf_counter() - self._rec_started:.0f} s)",
+                               *RED)
             if imgui.button("Stop recording"):
-                path = live.recording
-                n = self.act("stop recording", live.stop_recording)
-                if n is not None:  # the source keeps its recording state if stopping failed
-                    self.log(f"recorded {n} packets to {path}", GREEN)
-                    self.record_path = ""
+                self.set_recording(live, False)
         elif imgui.button("Start recording (raw packets, replayable)"):
-            path = self.record_path
+            self.set_recording(live, True)
+
+    def set_recording(self, live: LiveSource, on: bool):
+        """Start recording raw packets to the Recording panel's path (a new timestamped one if it is empty), or stop;
+        the panel and the phone link both come here."""
+        if on == bool(live.recording):
+            return
+        if on:
+            path = self.record_path or os.path.join("recordings", time.strftime("lidar_%Y%m%d_%H%M%S.lvxr"))
 
             def start():
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 live.start_recording(path)
 
             self.act("start recording", start)
+            if live.recording:
+                self._rec_started = time.perf_counter()
+                self.log(f"recording to {path}", GREEN)
+        else:
+            path = live.recording
+            n = self.act("stop recording", live.stop_recording)
+            if n is not None:  # the source keeps its recording state if stopping failed
+                self.log(f"recorded {n} packets to {path}", GREEN)
+                self.record_path = ""
 
     def _ui_ip_config(self, live: LiveSource):
         if not any(self.ip_edit):
@@ -1365,6 +1380,8 @@ class App:
             self.set_odom(bool(msg.get("on")))
         elif cmd == "sampling" and isinstance(self.source, LiveSource):
             self.set_sampling(self.source, bool(msg.get("on")))
+        elif cmd == "record" and isinstance(self.source, LiveSource):
+            self.set_recording(self.source, bool(msg.get("on")))
         elif cmd == "map":
             s.map_mode = bool(msg.get("on"))
         elif cmd == "color" and msg.get("mode") in COLOR_NAMES:
@@ -1408,8 +1425,11 @@ class App:
             ps = self.prior.status()
             prior = {"name": os.path.basename(self.prior.path), "state": ps["state"], "detail": ps["detail"],
                      "fit": float(ps["fit"]), "ready": bool(self.prior.ready)}
-        sampling = self.source.sampling if isinstance(self.source, LiveSource) else None  # None: not a LiDAR
-        return {"source": self.source.label if self.source else None, "sampling": sampling, "pps": round(self.pps),
+        live = self.source if isinstance(self.source, LiveSource) else None
+        sampling = live.sampling if live else None  # None: not a LiDAR
+        recording = (round(time.perf_counter() - self._rec_started, 1) if live.recording else False) if live else None
+        return {"source": self.source.label if self.source else None, "sampling": sampling, "recording": recording,
+                "pps": round(self.pps),
                 "pose": [round(float(v), 4) for v in self.pose_now.ravel()], "fov": CIRCULAR_FOV.get(self.dev_type),
                 "floor": round(float(s.grid_z), 2) if s.grid else None, "map": s.map_mode,
                 "color": COLOR_NAMES[s.color_mode], "odom": odom, "prior": prior}

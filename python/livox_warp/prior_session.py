@@ -321,19 +321,28 @@ class PriorSession:
 
     # ---- point sets ----------------------------------------------------------------------------
 
-    def _points_since(self, seconds: float):
+    def _points_since(self, seconds: float, t_end: float | None = None):
+        """The points of the `seconds` up to t_end (default: the newest point)."""
         if not self._batches:
             return None, None
-        t_end = self._batches[-1][1]
-        sel = [b for b in self._batches if b[1] >= t_end - seconds]
+        if t_end is None:
+            t_end = self._batches[-1][1]
+        sel = [b for b in self._batches if b[1] >= t_end - seconds and b[0] <= t_end]
+        if not sel:
+            return None, None
         x = np.concatenate([b[2] for b in sel])
         t = np.concatenate([b[3] for b in sel])
-        keep = t >= t_end - seconds
+        keep = (t >= t_end - seconds) & (t <= t_end)
         return x[keep], t[keep]
 
     def _world_points(self, seconds: float, odom: bool, T_W_now: np.ndarray):
-        """The recent points in W: placed by their frames' poses with odometry, by the fixed pose without."""
-        x, t = self._points_since(seconds)
+        """The recent points in W: placed by their frames' poses with odometry, by the fixed pose without.
+        With odometry the window ends at its newest frame, not at the newest point: under load the odometry
+        runs behind the points, and a window past its frames would have no poses to place them with."""
+        if odom and not self._frames:
+            return None
+        t_end = (max(self._frames) + 1) * self.frame_dt if odom else None
+        x, t = self._points_since(seconds, t_end)
         if x is None or len(x) < 500:
             return None
         if not odom:
