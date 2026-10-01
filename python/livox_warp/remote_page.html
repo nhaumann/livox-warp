@@ -1,0 +1,570 @@
+<!doctype html>
+<!-- livox-warp phone link: served by remote.py. The cloud arrives as binary snapshots over the WebSocket and
+     is drawn here with WebGL2; status arrives as JSON; the buttons send commands back. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0e0f13">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>livox-warp</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0e0f13; --panel: rgba(18, 20, 26, 0.86); --line: rgba(255, 255, 255, 0.08);
+    --text: #e8eaf0; --dim: #9aa1ad; --ok: #74e68c; --warn: #ffbf40; --bad: #ff5a4d; --accent: #59f2d9;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #top {
+    position: fixed; top: 0; left: 0; right: 0; padding: calc(env(safe-area-inset-top) + 8px) 12px 10px;
+    background: linear-gradient(var(--panel) 70%, transparent); pointer-events: none;
+  }
+  .row { display: flex; align-items: center; gap: 8px; min-height: 24px; white-space: nowrap; overflow: hidden; }
+  .dim, #source { overflow: hidden; text-overflow: ellipsis; }
+  .dim { color: var(--dim); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .chip { padding: 1px 8px; border-radius: 10px; font-weight: 600; font-size: 12px; background: var(--line); flex: none; }
+  .chip.ok { color: #0b2512; background: var(--ok); }
+  .chip.warn { color: #2b1d00; background: var(--warn); }
+  .chip.bad { color: #2b0805; background: var(--bad); }
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 8px; overflow-x: auto;
+    padding: 10px 12px calc(env(safe-area-inset-bottom) + 10px); background: linear-gradient(transparent, var(--panel) 30%);
+    scrollbar-width: none;
+  }
+  #bar::-webkit-scrollbar { display: none; }
+  button, select {
+    flex: none; height: 44px; padding: 0 16px; border-radius: 22px; border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.07); color: var(--text); font: inherit; font-weight: 600; touch-action: manipulation;
+  }
+  select { padding: 0 12px; -webkit-appearance: none; appearance: none; }
+  button.on { background: var(--accent); color: #062420; border-color: transparent; }
+  button.danger { background: rgba(255, 90, 77, 0.16); color: #ffb3ac; border-color: rgba(255, 90, 77, 0.4); }
+  button.armed { background: var(--bad); color: #fff; }
+  button.paused { background: var(--warn); color: #2b1d00; border-color: transparent; }
+  button:disabled { opacity: 0.4; }
+  #msg {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: 80%; padding: 16px 20px;
+    border-radius: 14px; background: var(--panel); text-align: center; color: var(--dim);
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="top">
+  <div class="row"><span id="link" class="dot"></span><span id="source">connecting</span><span id="paused" class="chip warn" hidden>paused</span></div>
+  <div class="row"><span id="slam" class="chip">SLAM off</span><span id="slamDetail" class="dim"></span></div>
+  <div class="row" id="priorRow" hidden><span id="prior" class="chip"></span><span id="priorDetail" class="dim"></span></div>
+  <div class="row dim" id="rate"></div>
+</div>
+<div id="bar">
+  <button id="reset" class="danger">Reset SLAM</button>
+  <button id="sampling" hidden>Pause LiDAR</button>
+  <button id="odom">SLAM</button>
+  <button id="mapMode">Map</button>
+  <button id="follow" class="on">Follow</button>
+  <select id="color" aria-label="colours"></select>
+  <select id="budget" aria-label="points per snapshot">
+    <option value="100000">100k points</option>
+    <option value="250000">250k points</option>
+    <option value="600000">600k points</option>
+  </select>
+  <button id="localise" hidden>Localise</button>
+</div>
+<div id="msg" hidden></div>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const KEY = new URLSearchParams(location.hash.slice(1)).get("k");
+const HEADER_BYTES = 28;  // remote.CLOUD_HEADER: magic, seq, n, origin xyz, metres per step
+const PATH_COLOR = [0.35, 0.95, 0.85];
+const SENSOR_COLOR = [1.0, 0.8, 0.3];
+const FOV_Y = 60 * Math.PI / 180;
+
+// ---- storage (best effort: private windows may refuse it) -------------------------------------------
+
+function load(name, fallback) {
+  try { return localStorage.getItem(name) ?? fallback; } catch { return fallback; }
+}
+function save(name, value) {
+  try { localStorage.setItem(name, value); } catch { /* not kept */ }
+}
+
+// ---- small matrix helpers (column-major, as WebGL wants) ----------------------------------------------
+
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const normalize = (a) => scale(a, 1 / Math.hypot(...a));
+
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0];
+}
+
+function lookAt(eye, target, up) {
+  const z = normalize(sub(eye, target)), x = normalize(cross(up, z)), y = cross(z, x);
+  return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, eye), -dot(y, eye), -dot(z, eye), 1];
+}
+
+function multiply(a, b) {
+  const out = new Array(16);
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++)
+      out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return out;
+}
+
+// ---- WebGL ---------------------------------------------------------------------------------------------
+
+const canvas = $("view");
+const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, powerPreference: "high-performance" });
+
+function program(vs, fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const POINTS = gl && program(`#version 300 es
+  layout(location = 0) in vec3 a_q;    // int16 steps from the snapshot's origin
+  layout(location = 1) in vec3 a_rgb;
+  uniform mat4 u_mvp;
+  uniform vec3 u_origin;
+  uniform float u_res, u_size;
+  out vec3 v_rgb;
+  void main() {
+    gl_Position = u_mvp * vec4(u_origin + a_q * u_res, 1.0);
+    gl_PointSize = u_size;
+    v_rgb = a_rgb;
+  }`, `#version 300 es
+  precision mediump float;
+  in vec3 v_rgb;
+  out vec4 color;
+  void main() {
+    vec2 d = gl_PointCoord * 2.0 - 1.0;
+    if (dot(d, d) > 1.0) discard;
+    color = vec4(v_rgb, 1.0);
+  }`);
+
+const LINES = gl && program(`#version 300 es
+  layout(location = 0) in vec3 a_pos;
+  uniform mat4 u_mvp;
+  void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); }`, `#version 300 es
+  precision mediump float;
+  uniform vec4 u_color;
+  out vec4 color;
+  void main() { color = u_color; }`);
+
+function uniforms(p, names) {
+  return Object.fromEntries(names.map((n) => [n, gl.getUniformLocation(p, n)]));
+}
+const U_POINTS = gl && uniforms(POINTS, ["u_mvp", "u_origin", "u_res", "u_size"]);
+const U_LINES = gl && uniforms(LINES, ["u_mvp", "u_color"]);
+
+// one vertex array per drawable; the cloud has two buffers (int16 xyz, RGB8), the line sets one (float xyz)
+function lineSet() {
+  const vao = gl.createVertexArray(), buf = gl.createBuffer();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, buf, n: 0 };
+}
+
+function setLines(set, data) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, set.buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  set.n = data.length / 3;
+}
+
+const cloud = { n: 0, origin: [0, 0, 0], res: 0.01 };
+if (gl) {
+  cloud.vao = gl.createVertexArray();
+  cloud.pos = gl.createBuffer();
+  cloud.rgb = gl.createBuffer();
+  gl.bindVertexArray(cloud.vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloud.pos);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.SHORT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloud.rgb);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.UNSIGNED_BYTE, true, 0, 0);
+  gl.bindVertexArray(null);
+}
+const path = gl && lineSet(), sensor = gl && lineSet(), grid = gl && lineSet();
+
+// ---- camera: orbit around a target, z up, like the viewer's -------------------------------------------
+
+const cam = { target: [0, 0, 0], yaw: -2.4, pitch: 0.45, dist: 12, follow: true };
+let pose = null;   // sensor-to-world, row-major 4x4 from the viewer
+let framed = false;
+
+function eye() {
+  const cp = Math.cos(cam.pitch);
+  return add(cam.target, scale([cp * Math.cos(cam.yaw), cp * Math.sin(cam.yaw), Math.sin(cam.pitch)], cam.dist));
+}
+
+function followTarget() {
+  // what the scanner looks at: a few metres ahead along its forward (x) axis, as the viewer's follow mode
+  return [pose[3] + 3 * pose[0], pose[7] + 3 * pose[4], pose[11] + 3 * pose[8]];
+}
+
+function pan(dx, dy) {
+  const fwd = normalize(sub(cam.target, eye()));
+  const right = normalize(cross(fwd, [0, 0, 1])), up = cross(right, fwd);
+  const k = 2 * Math.tan(FOV_Y / 2) * cam.dist / canvas.clientHeight;
+  cam.target = add(cam.target, add(scale(right, -dx * k), scale(up, dy * k)));
+  setFollow(false);
+}
+
+function rotate(dx, dy) {
+  cam.yaw -= dx * 0.008;
+  cam.pitch = Math.min(1.5, Math.max(-1.5, cam.pitch + dy * 0.008));
+}
+
+function zoom(factor) {
+  cam.dist = Math.min(500, Math.max(0.3, cam.dist * factor));
+}
+
+// pointer gestures: one finger orbits, two pinch and pan, a double tap goes back to following the scanner;
+// with a mouse, the right button (or shift) pans and the wheel zooms
+const pointers = new Map();
+const PINCH_DRIFT_PX = 40;  // two-finger movement that still counts as a pinch, not a pan away from the scanner
+let lastTap = 0, pinchDrift = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  pinchDrift = 0;
+  if (pointers.size === 1) {
+    const now = performance.now();
+    if (now - lastTap < 300) setFollow(true);
+    lastTap = now;
+  }
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  if (pointers.size === 1) {
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    if (e.buttons === 2 || e.shiftKey) pan(dx, dy); else rotate(dx, dy);
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const other = a === p ? b : a;
+    const before = Math.hypot(p.x - other.x, p.y - other.y);
+    const after = Math.hypot(e.clientX - other.x, e.clientY - other.y);
+    if (after > 0) zoom(before / after);
+    const dx = (e.clientX - p.x) / 2, dy = (e.clientY - p.y) / 2;  // each finger moves the midpoint by half
+    pinchDrift += Math.hypot(dx, dy);
+    if (!cam.follow || pinchDrift > PINCH_DRIFT_PX) pan(dx, dy);
+  }
+  p.x = e.clientX;
+  p.y = e.clientY;
+});
+
+for (const type of ["pointerup", "pointercancel"]) canvas.addEventListener(type, (e) => pointers.delete(e.pointerId));
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoom(Math.exp(e.deltaY * 0.001)); }, { passive: false });
+
+// ---- scene pieces --------------------------------------------------------------------------------------
+
+function frameCloud(q, n) {
+  // first snapshot: pull back far enough to see most of it
+  if (framed || n === 0) return;
+  const step = Math.max(1, Math.floor(n / 2000));
+  let r = 0;
+  for (let i = 0; i < n; i += step) r = Math.max(r, Math.hypot(q[3 * i], q[3 * i + 1], q[3 * i + 2]));
+  cam.dist = Math.min(80, Math.max(4, r * cloud.res * 0.8));
+  framed = true;
+}
+
+function sensorLines(fovDeg) {
+  // the scanner's viewing cone: apex at the sensor, a ring 0.6 m ahead, four edges
+  const T = pose, o = [T[3], T[7], T[11]];
+  const x = [T[0], T[4], T[8]], y = [T[1], T[5], T[9]], z = [T[2], T[6], T[10]];
+  const d = 0.6, r = d * Math.tan((fovDeg ?? 38.4) * Math.PI / 360), ring = [];
+  for (let i = 0; i <= 24; i++) {
+    const a = (i / 24) * 2 * Math.PI;
+    ring.push(add(o, add(scale(x, d), add(scale(y, r * Math.cos(a)), scale(z, r * Math.sin(a))))));
+  }
+  const v = [];
+  for (let i = 0; i < 24; i++) v.push(...ring[i], ...ring[i + 1]);
+  for (let i = 0; i < 24; i += 6) v.push(...o, ...ring[i]);
+  return new Float32Array(v);
+}
+
+function gridLines(z) {
+  const c = cam.target, v = [], half = 15;
+  const cx = Math.round(c[0]), cy = Math.round(c[1]);
+  for (let k = -half; k <= half; k++) {
+    v.push(cx + k, cy - half, z, cx + k, cy + half, z);
+    v.push(cx - half, cy + k, z, cx + half, cy + k, z);
+  }
+  return new Float32Array(v);
+}
+
+// ---- drawing -------------------------------------------------------------------------------------------
+
+let floorZ = null, gridKey = "";
+
+function draw() {
+  requestAnimationFrame(draw);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  if (cam.follow && pose) {
+    const t = followTarget();
+    cam.target = add(cam.target, scale(sub(t, cam.target), 0.15));  // ease toward it between status updates
+  }
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0.055, 0.06, 0.075, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  const mvp = multiply(perspective(FOV_Y, w / h, 0.05, 2000), lookAt(eye(), cam.target, [0, 0, 1]));
+
+  gl.useProgram(LINES);
+  gl.uniformMatrix4fv(U_LINES.u_mvp, false, mvp);
+  if (floorZ !== null) {
+    const key = `${Math.round(cam.target[0])},${Math.round(cam.target[1])},${floorZ}`;
+    if (key !== gridKey) { setLines(grid, gridLines(floorZ)); gridKey = key; }
+    gl.uniform4f(U_LINES.u_color, 1, 1, 1, 0.07);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.bindVertexArray(grid.vao);
+    gl.drawArrays(gl.LINES, 0, grid.n);
+    gl.disable(gl.BLEND);
+  }
+
+  if (cloud.n) {
+    gl.useProgram(POINTS);
+    gl.uniformMatrix4fv(U_POINTS.u_mvp, false, mvp);
+    gl.uniform3fv(U_POINTS.u_origin, cloud.origin);
+    gl.uniform1f(U_POINTS.u_res, cloud.res);
+    gl.uniform1f(U_POINTS.u_size, 2 * dpr);
+    gl.bindVertexArray(cloud.vao);
+    gl.drawArrays(gl.POINTS, 0, cloud.n);
+  }
+
+  gl.useProgram(LINES);
+  if (path.n > 1) {
+    gl.uniform4f(U_LINES.u_color, ...PATH_COLOR, 1);
+    gl.bindVertexArray(path.vao);
+    gl.drawArrays(gl.LINE_STRIP, 0, path.n);
+  }
+  if (sensor.n) {
+    gl.uniform4f(U_LINES.u_color, ...SENSOR_COLOR, 1);
+    gl.bindVertexArray(sensor.vao);
+    gl.drawArrays(gl.LINES, 0, sensor.n);
+  }
+  gl.bindVertexArray(null);
+}
+
+// ---- link ----------------------------------------------------------------------------------------------
+
+let ws = null, failures = 0, snapshots = [];
+const pathPts = [];
+
+function send(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function showMessage(text) {
+  $("msg").textContent = text;
+  $("msg").hidden = !text;
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws?k=${encodeURIComponent(KEY)}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    failures = 0;
+    $("link").className = "dot ok";
+    showMessage(cloud.n ? "" : "waiting for points");
+    send({ budget: Number($("budget").value) });
+  };
+  ws.onmessage = (e) => (typeof e.data === "string" ? onText(JSON.parse(e.data)) : onCloud(e.data));
+  ws.onclose = () => {
+    $("link").className = "dot bad";
+    failures += 1;
+    if (failures >= 3) showMessage("Can't reach the viewer. Is its phone link on, and this phone on the same network? "
+                                   + "If the link was renewed, scan the new QR code.");
+    setTimeout(() => { if (document.visibilityState === "visible") connect(); }, Math.min(5000, 500 * failures));
+  };
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && (!ws || ws.readyState === WebSocket.CLOSED)) connect();
+});
+
+function onCloud(buf) {
+  const head = new DataView(buf, 0, HEADER_BYTES);
+  const magic = String.fromCharCode(...new Uint8Array(buf, 0, 4));
+  if (magic !== "LWC1") return;
+  const seq = head.getUint32(4, true), n = head.getUint32(8, true);
+  cloud.origin = [head.getFloat32(12, true), head.getFloat32(16, true), head.getFloat32(20, true)];
+  cloud.res = head.getFloat32(24, true);
+  const q = new Int16Array(buf, HEADER_BYTES, 3 * n);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloud.pos);
+  gl.bufferData(gl.ARRAY_BUFFER, q, gl.STREAM_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloud.rgb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(buf, HEADER_BYTES + 6 * n, 3 * n), gl.STREAM_DRAW);
+  cloud.n = n;
+  frameCloud(q, n);
+  send({ ack: seq });  // only now may the viewer send the next one
+  const now = performance.now();
+  snapshots.push([now, buf.byteLength]);
+  snapshots = snapshots.filter(([t]) => now - t < 2000);
+  if (n) showMessage("");
+}
+
+function onText(msg) {
+  if (msg.type === "hello") {
+    const select = $("color"), names = msg.colors || [];
+    select.replaceChildren(...names.map((name) => new Option(name[0].toUpperCase() + name.slice(1), name)));
+  } else if (msg.type === "status") {
+    onStatus(msg);
+  }
+}
+
+function fmtCount(n) {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${n}`;
+}
+
+function setChip(el, text, level) {
+  el.textContent = text;
+  el.className = `chip ${level}`;
+}
+
+let sampling = null;  // the LiDAR's point output: true, false, or null when the source is not a LiDAR
+
+function onStatus(st) {
+  $("source").textContent = st.source || "no source";
+  sampling = st.sampling ?? null;
+  $("sampling").hidden = sampling === null;
+  $("sampling").textContent = sampling === false ? "Resume LiDAR" : "Pause LiDAR";
+  $("sampling").classList.toggle("paused", sampling === false);
+  $("paused").hidden = sampling !== false;
+  const secs = snapshots.length > 1 ? (snapshots.at(-1)[0] - snapshots[0][0]) / 1000 : 0;
+  const hz = secs > 0 ? (snapshots.length - 1) / secs : 0;
+  const mbps = secs > 0 ? snapshots.slice(1).reduce((s, [, b]) => s + b, 0) * 8 / secs / 1e6 : 0;
+  $("rate").textContent =
+    `${fmtCount(st.pps)} pts/s in · ${fmtCount(cloud.n)} shown · ${hz.toFixed(1)} Hz · ${mbps.toFixed(0)} Mbit/s`;
+
+  const o = st.odom;
+  if (!o) {
+    setChip($("slam"), "SLAM off", "");
+    $("slamDetail").textContent = "";
+  } else {
+    if (o.warm) setChip($("slam"), "starting: hold still", "warn");
+    else if (o.weak) setChip($("slam"), "weak geometry", "warn");
+    else setChip($("slam"), "tracking", "ok");
+    const held = o.held ? ` · ${o.held} held` : "";
+    $("slamDetail").textContent =
+      `rms ${(o.rms * 100).toFixed(1)} cm · ${o.speed.toFixed(2)} m/s · ${o.turn.toFixed(0)}°/s · ${o.frames} frames${held}`;
+  }
+  $("odom").classList.toggle("on", !!o);
+  $("mapMode").classList.toggle("on", st.map);
+  if (document.activeElement !== $("color")) $("color").value = st.color;
+
+  const pr = st.prior;
+  $("priorRow").hidden = !pr;
+  $("localise").hidden = !(pr && pr.ready);
+  if (pr) {
+    const level = { tracking: "ok", lost: "warn", ambiguous: "warn", error: "bad" }[pr.state] || "";
+    setChip($("prior"), `${pr.name}: ${pr.state}`, level);
+    $("priorDetail").textContent = pr.state === "tracking" ? `fit ${pr.fit.toFixed(2)}` : pr.detail || "";
+  }
+
+  pose = st.pose;
+  floorZ = st.floor;
+  if (pose) setLines(sensor, sensorLines(st.fov));
+  if (st.path.reset) pathPts.length = 0;
+  for (const p of st.path.pts) pathPts.push(...p);
+  if (st.path.reset || st.path.pts.length) setLines(path, new Float32Array(pathPts));
+}
+
+// ---- controls ------------------------------------------------------------------------------------------
+
+function setFollow(on) {
+  cam.follow = on;
+  $("follow").classList.toggle("on", on);
+}
+
+let resetArmed = null;
+$("reset").addEventListener("click", () => {
+  const button = $("reset");
+  if (!resetArmed) {  // two taps, so a stray touch never throws the map away
+    button.classList.add("armed");
+    button.textContent = "Tap again to reset";
+    resetArmed = setTimeout(() => {
+      resetArmed = null;
+      button.classList.remove("armed");
+      button.textContent = "Reset SLAM";
+    }, 3000);
+    return;
+  }
+  clearTimeout(resetArmed);
+  resetArmed = null;
+  button.classList.remove("armed");
+  button.textContent = "Reset SLAM";
+  send({ cmd: "reset" });
+  if (navigator.vibrate) navigator.vibrate(40);
+  setFollow(true);
+});
+$("sampling").addEventListener("click", () => {
+  send({ cmd: "sampling", on: !sampling });
+  $("sampling").disabled = true;  // the LiDAR takes a moment to answer; the next status shows its state
+  setTimeout(() => { $("sampling").disabled = false; }, 1500);
+});
+$("odom").addEventListener("click", () => send({ cmd: "odometry", on: !$("odom").classList.contains("on") }));
+$("mapMode").addEventListener("click", () => send({ cmd: "map", on: !$("mapMode").classList.contains("on") }));
+$("follow").addEventListener("click", () => setFollow(!cam.follow));
+$("color").addEventListener("change", (e) => { send({ cmd: "color", mode: e.target.value }); e.target.blur(); });
+$("localise").addEventListener("click", () => send({ cmd: "localise" }));
+$("budget").value = load("budget", "250000");
+$("budget").addEventListener("change", (e) => {
+  save("budget", e.target.value);
+  send({ budget: Number(e.target.value) });
+  e.target.blur();
+});
+
+// ---- start ---------------------------------------------------------------------------------------------
+
+if (!gl) {
+  showMessage("This browser has no WebGL2, which the point cloud needs.");
+} else if (!KEY) {
+  showMessage("Open this page from the link (or QR code) in the viewer's Phone link section: it carries the key.");
+} else {
+  showMessage("connecting");
+  connect();
+  requestAnimationFrame(draw);
+}
+</script>
+</body>
+</html>

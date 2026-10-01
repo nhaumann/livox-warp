@@ -28,6 +28,8 @@ dependencies = [
     "moderngl>=5.10",
     "laspy>=2.5",
     "pillow>=10",
+    "websockets>=13",
+    "segno>=1.6",
 ]
 
 [project.optional-dependencies]

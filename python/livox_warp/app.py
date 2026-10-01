@@ -10,12 +10,15 @@ Panels:
                 and the prior map (localisation in an earlier scan, drift correction, Changes colours).
     Stats       frame and GPU timings, packet counters, the point-rate history.
 
+Phone link (remote.py, View > Phone link or --remote): the cloud, pose and SLAM state in a phone's browser,
+and SLAM controls from it.
+
 Command line: ``python -m livox_warp --help``. A source can be chosen up front (--lidar, --replay, --sim);
 otherwise the viewer auto-connects to the first LiDAR it discovers. --frames with --screenshot or
 --frames-dir renders a fixed number of frames and exits, for tests and README animations.
 
-Config file: only the viewer mount pose is persisted (see Settings and --config); everything else starts
-from the Settings defaults and the command line.
+Config file: the viewer mount pose and the phone link's key are persisted (see --config); everything else
+starts from the Settings defaults and the command line.
 """
 
 from __future__ import annotations
@@ -40,11 +43,12 @@ import moderngl  # noqa: E402
 import warp as wp  # noqa: E402
 from imgui.integrations.pyglet import create_renderer  # noqa: E402
 
-from . import _native, export, gpu  # noqa: E402
+from . import _native, export, gpu, remote  # noqa: E402
 from .netcfg import add_host_alias, suggest_host  # noqa: E402
 from .odom import Odometry  # noqa: E402
 from .perception import Perception  # noqa: E402
 from .prior_session import PriorSession  # noqa: E402
+from .remote import CloudPacker, RemoteServer  # noqa: E402
 from .render import DrawOptions, OrbitCamera, Renderer, arrow_lines, box_lines  # noqa: E402
 from .slam_worker import OdomWorker  # noqa: E402
 from .sources import DEV_UNKNOWN, MID40, SIM_MOTIONS, SIM_SCENES, LiveSource, ReplaySource, SimSource  # noqa: E402
@@ -55,10 +59,10 @@ COLOR_NAMES = [m.lower() for m in gpu.COLOR_MODES]  # --color choices, in gpu.MO
 CIRCULAR_FOV = {MID40: 38.4}  # degrees, for the gizmo of sensors with a circular field of view
 LOG_SLIDER = getattr(imgui, "SLIDER_FLAGS_LOGARITHMIC", 0)
 RED, AMBER, GREEN, GREY = (1.0, 0.35, 0.3), (1.0, 0.75, 0.25), (0.45, 0.9, 0.5), (0.6, 0.62, 0.66)
-PRIOR_LOG_COLORS = {"info": GREY, "ok": GREEN, "warn": AMBER}
+LEVEL_COLORS = {"info": GREY, "ok": GREEN, "warn": AMBER}  # log levels of PriorSession and RemoteServer
 PRIOR_HINT = "npz from: python -m livox_warp.prior_map convert scan.e57"
 REPLAY_HINT = "path of an .lvxr file (Connected device > Recording writes them)"
-# settings remembered between runs: only the viewer mount pose
+# settings remembered between runs: the viewer mount pose and the phone link's key
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/.config"), "livox-warp", "viewer.json")
 
 
@@ -232,6 +236,17 @@ class App:
         self.prior = None  # PriorSession: localisation in a prior map, off the render thread
         self.prior_path = args.prior_map or ""
         self._prior_drawn = False
+        # phone link (remote.py): the server, and the packer that reads snapshots of the shaded cloud back
+        self.remote = None
+        self.packer = None
+        self.remote_qr = []
+        self.remote_addrs = []  # addresses a phone could use, for the link's URL; the first is the default
+        self.remote_port = remote.DEFAULT_PORT if args.remote is None else args.remote
+        self.remote_bind = args.remote_bind
+        self._status_at = 0.0  # last status sent to the phones
+        self._cloud_at = 0.0  # last snapshot started
+        self._cloud_gap = 0.0  # wait before the next one (remote.snapshot_gap of the last one's size)
+        self._path_gen = 0  # bumped whenever the trajectory restarts, so the phones drop theirs
 
         self.logs = collections.deque(maxlen=12)
         self.pending = collections.deque()
@@ -305,6 +320,8 @@ class App:
             self.set_odom(True)
         if args.prior_map:
             self.load_prior(args.prior_map)
+        if args.remote is not None:
+            self.start_remote()
 
     # ---- plumbing -------------------------------------------------------------------------
 
@@ -314,7 +331,11 @@ class App:
 
     def _prior_log(self, text: str, level: str):
         """PriorSession's log callback: its info / ok / warn levels in the viewer's colours."""
-        self.log(text, PRIOR_LOG_COLORS.get(level, GREY))
+        self.log(text, LEVEL_COLORS.get(level, GREY))
+
+    def _remote_log(self, text: str, level: str):
+        """RemoteServer's log callback; it runs on the server thread, so the line is logged by the UI thread."""
+        self.pending.append(lambda: self.log(text, LEVEL_COLORS.get(level, GREY)))
 
     def job(self, label: str, fn, on_ok=None):
         """Run a blocking device call off the UI thread; callbacks run back on the UI thread."""
@@ -377,6 +398,7 @@ class App:
         self.odom_stats = Odometry.empty_stats()
         self.odom_traj = []
         self._traj_seg = None
+        self._path_gen += 1
         self.pipe.epoch += 1  # pose-table entries from before the clear no longer count
         self.pipe.set_pose(0, self.mount, None, self.pipe.epoch)
         self.pose_now = self.mount.astype(np.float64)
@@ -396,6 +418,11 @@ class App:
         self.clear_all()
         self.log("odometry on: frames register against the map; world = first frame's mount pose" if on
                  else "odometry off", GREY)
+
+    def set_sampling(self, live: LiveSource, on: bool):
+        """Start or stop the LiDAR's point output (a device command, so off the UI thread)."""
+        if on != live.sampling:
+            self.job("start sampling" if on else "stop sampling", live.start if on else live.stop)
 
     def connect(self, lidar_ip: str, host_ip: str, dev_type: int):
         if isinstance(self.source, LiveSource):
@@ -552,6 +579,7 @@ class App:
         s = self.s
         while self.pending:
             self.pending.popleft()()
+        self._remote_tick()
 
         fb_w, fb_h = self.window.get_framebuffer_size()
         self.imgui.process_inputs()
@@ -621,6 +649,10 @@ class App:
             self.prior.grid.distances(self.pipe.c_xyz, count, self.prior.T_MW, self.pipe.chg, None)
         pos, col, nrm = self.gl.map()
         self.pipe.shade(self.make_shade(need_normals), pos, col, nrm)
+        if self._cloud_due():
+            # read while the GL buffers are mapped: the phones get the points in the colours drawn here
+            self.packer.pack(pos, col, count, self.pose_now[:3, 3], self.remote.budget, self.pipe.stream)
+            self._cloud_at = time.perf_counter()
         if self.ev1 is not None:
             wp.record_event(self.ev1)
         self.gl.unmap()
@@ -857,12 +889,8 @@ class App:
         age = st.get("heartbeat_age")
         imgui.text_colored(f"heartbeat {age:.1f}s ago" if age is not None else "no heartbeat yet", *GREY)
 
-        if live.sampling:
-            if imgui.button("Stop sampling"):
-                self.job("stop sampling", live.stop)
-        else:
-            if imgui.button("Start sampling"):
-                self.job("start sampling", live.start)
+        if imgui.button("Stop sampling" if live.sampling else "Start sampling"):
+            self.set_sampling(live, not live.sampling)
         imgui.same_line()
         if imgui.button("Disconnect"):
             self.set_source(None)
@@ -1028,6 +1056,8 @@ class App:
             self._ui_mount()
         if imgui.collapsing_header("Scene")[0]:
             self._ui_scene()
+        if imgui.collapsing_header("Phone link", flags=imgui.TREE_NODE_DEFAULT_OPEN if self.remote else 0)[0]:
+            self._ui_phone()
 
         imgui.separator()
         if imgui.button("Fit"):
@@ -1274,6 +1304,165 @@ class App:
         self.prior = None
         self.gl.set_prior(None)
         self._prior_drawn = False
+
+    # ---- phone link ----------------------------------------------------------------------------
+
+    def start_remote(self):
+        """Serve the phone page (remote.py). The key is kept in the config, so a bookmarked link keeps working."""
+        if self.remote is not None:
+            return
+        key = self.config.get("remote_key")
+        if not isinstance(key, str) or len(key) < 8:
+            key = self._new_remote_key()
+        if self.remote_bind in ("", "0.0.0.0"):
+            self.remote_addrs = remote.phone_addresses(ip for _, ip, _ in self.ifaces) or [remote.lan_address()]
+        else:
+            self.remote_addrs = [self.remote_bind]
+        link = RemoteServer(key, self.remote_port, self.remote_bind, address=self.remote_addrs[0],
+                            hello={"colors": COLOR_NAMES}, log=self._remote_log)
+        try:
+            link.start()
+        except OSError as e:
+            self.log(f"phone link on port {self.remote_port}: {e}", RED)
+            return
+        if self.packer is None:
+            self.packer = CloudPacker(self.device)
+        self.remote = link
+        self.remote_qr = remote.qr_modules(link.url)
+        self.log(f"phone link: open {link.url} on a phone on this network, or scan View > Phone link", GREEN)
+
+    def stop_remote(self):
+        if self.remote is None:
+            return
+        self.remote.close()
+        self.remote = None
+        self.log("phone link stopped", GREY)
+
+    def renew_remote_key(self):
+        """A new key: the connected phones drop off and old links and codes stop working."""
+        self._new_remote_key()
+        if self.remote is not None:
+            self.stop_remote()
+            self.start_remote()
+
+    def _new_remote_key(self) -> str:
+        key = remote.new_key()
+        self.config["remote_key"] = key
+        try:
+            save_config(self.config_path, self.config)
+        except OSError as e:
+            self.log(f"could not save the phone link key ({e}); the link will change next run", AMBER)
+        return key
+
+    def remote_command(self, msg: dict, who: str):
+        """A command from the phone page, run on the render thread like a panel action."""
+        s = self.s
+        cmd = msg.get("cmd")
+        if cmd == "reset":
+            self.clear_all()
+            self.log(f"SLAM reset from {who}", AMBER)
+        elif cmd == "odometry":
+            self.set_odom(bool(msg.get("on")))
+        elif cmd == "sampling" and isinstance(self.source, LiveSource):
+            self.set_sampling(self.source, bool(msg.get("on")))
+        elif cmd == "map":
+            s.map_mode = bool(msg.get("on"))
+        elif cmd == "color" and msg.get("mode") in COLOR_NAMES:
+            s.color_mode = COLOR_NAMES.index(msg["mode"])
+        elif cmd == "localise" and self.prior is not None and self.prior.ready:
+            self.prior.localise_now()
+        else:
+            self.log(f"{who}: ignored phone command {msg!r}", AMBER)
+
+    def _cloud_due(self) -> bool:
+        return (self.remote is not None and self.remote.want_cloud and not self.packer.busy
+                and time.perf_counter() - self._cloud_at >= self._cloud_gap)
+
+    def _remote_tick(self):
+        """Once per frame: run the phones' commands, hand over a finished snapshot, send the status."""
+        link = self.remote
+        if link is None:
+            return
+        while link.commands:
+            msg, who = link.commands.popleft()
+            self.act(f"phone command {msg.get('cmd')}", lambda: self.remote_command(msg, who))
+        data = self.packer.poll()
+        if data is not None:
+            link.publish_cloud(data)
+            self._cloud_gap = remote.snapshot_gap(len(data))
+        now = time.perf_counter()
+        if now - self._status_at >= 1.0 / remote.STATUS_HZ:
+            self._status_at = now
+            link.publish_status(self._remote_status(), self.odom_traj, self._path_gen)
+
+    def _remote_status(self) -> dict:
+        """What the phone page shows besides the cloud, in plain JSON types."""
+        s, st = self.s, self.odom_stats
+        odom = None
+        if s.odom:
+            odom = {"frames": int(st["frames"]), "rms": float(st["rms"]), "speed": float(st["speed"]),
+                    "turn": float(st["turn"]), "weak": bool(st["weak"]), "held": int(st.get("degen", 0)),
+                    "warm": bool(st.get("warm"))}
+        prior = None
+        if self.prior is not None:
+            ps = self.prior.status()
+            prior = {"name": os.path.basename(self.prior.path), "state": ps["state"], "detail": ps["detail"],
+                     "fit": float(ps["fit"]), "ready": bool(self.prior.ready)}
+        sampling = self.source.sampling if isinstance(self.source, LiveSource) else None  # None: not a LiDAR
+        return {"source": self.source.label if self.source else None, "sampling": sampling, "pps": round(self.pps),
+                "pose": [round(float(v), 4) for v in self.pose_now.ravel()], "fov": CIRCULAR_FOV.get(self.dev_type),
+                "floor": round(float(s.grid_z), 2) if s.grid else None, "map": s.map_mode,
+                "color": COLOR_NAMES[s.color_mode], "odom": odom, "prior": prior}
+
+    def _ui_phone(self):
+        link = self.remote
+        if link is None:
+            imgui.text_wrapped("See the cloud and the SLAM state in a phone's browser, and reset SLAM from there. "
+                               "The phone has to be on the same network as this computer.")
+            if imgui.button("Start phone link"):
+                self.start_remote()
+            return
+        n = link.n_clients
+        imgui.text_colored(f"{n} phone{'' if n == 1 else 's'} connected" if n else "scan the code with a phone",
+                           *(GREEN if n else GREY))
+        self._ui_qr(self.remote_qr)
+        if len(self.remote_addrs) > 1:
+            # more than one network: the code has to name the one the phone is on
+            i = self.remote_addrs.index(link.address) if link.address in self.remote_addrs else 0
+            changed, i = imgui.combo("address", i, self.remote_addrs)
+            if changed:
+                link.address = self.remote_addrs[i]
+                self.remote_qr = remote.qr_modules(link.url)
+        if not remote.reachable(link.address):
+            imgui.text_colored(f"{link.address} is only reachable from this computer: start without --remote-bind",
+                               *AMBER)
+        imgui.text_wrapped(link.url)
+        if imgui.button("Copy link"):
+            imgui.set_clipboard_text(link.url)
+        imgui.same_line()
+        if imgui.button("New key"):
+            self.renew_remote_key()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("disconnects the phones; old links and codes stop working")
+        imgui.same_line()
+        if imgui.button("Stop"):
+            self.stop_remote()
+
+    @staticmethod
+    def _ui_qr(modules: list, module_px: int = 5, quiet: int = 2):
+        """A QR code on the window's draw list: dark modules on white, inside a quiet zone."""
+        size = (len(modules) + 2 * quiet) * module_px
+        x0, y0 = imgui.get_cursor_screen_pos()
+        dl = imgui.get_window_draw_list()
+        dl.add_rect_filled(x0, y0, x0 + size, y0 + size, imgui.get_color_u32_rgba(1.0, 1.0, 1.0, 1.0))
+        dark = imgui.get_color_u32_rgba(0.0, 0.0, 0.0, 1.0)
+        for r, row in enumerate(modules):
+            y = y0 + (r + quiet) * module_px
+            for c, on in enumerate(row):
+                if on:
+                    x = x0 + (c + quiet) * module_px
+                    dl.add_rect_filled(x, y, x + module_px, y + module_px, dark)
+        imgui.dummy(size, size)
 
     def ui_prior(self):
         s = self.s
@@ -1536,6 +1725,7 @@ class App:
     def shutdown(self):
         if tuple(self.s.mount) != self.mount_saved:
             self._save_mount()
+        self.stop_remote()
         if self.source is not None:
             try:
                 self.source.close()
@@ -1613,6 +1803,12 @@ def main(argv=None):
     sys_.add_argument("--no-vsync", action="store_true", help="don't wait for the display's vertical sync")
     sys_.add_argument("--config", metavar="JSON",
                       help=f"settings file (default {CONFIG_PATH}); only the viewer mount pose is stored in it")
+    link = p.add_argument_group("phone link (also View > Phone link)")
+    link.add_argument("--remote", nargs="?", type=int, const=remote.DEFAULT_PORT, metavar="PORT",
+                      help="serve the phone page and its WebSocket on PORT "
+                           f"(default {remote.DEFAULT_PORT}; 0 picks a free port)")
+    link.add_argument("--remote-bind", default="0.0.0.0", metavar="ADDR",
+                      help="address the phone link listens on (default: all of this computer's addresses)")
     cap = p.add_argument_group("capture (tests and README animations)")
     cap.add_argument("--frames", type=int, default=0, help="exit after N frames")
     cap.add_argument("--screenshot", metavar="PNG", help="save the last frame (with --frames)")
