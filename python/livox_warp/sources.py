@@ -27,6 +27,7 @@ import numpy as np
 import warp as wp
 
 from . import _native
+from .rosette import RosetteParams, rosette_dir_p
 
 # Livox device type codes as the protocol reports them (the viewer keys its Mid-40 UI on MID40).
 MID40 = 1
@@ -469,6 +470,57 @@ def k_sim_scan(
     out_t[i] = t
 
 
+@wp.kernel
+def k_sim_scan_rosette(
+    t0: float,
+    dt: float,
+    first: int,
+    motion: int,
+    sc: SimScene,
+    ros: RosetteParams,
+    out_xyz: wp.array(dtype=wp.vec3),
+    out_attr: wp.array(dtype=wp.uint32),
+    out_t: wp.array(dtype=wp.float32),
+):
+    """k_sim_scan with a fitted scan pattern (rosette.RosetteModel) in place of the built-in one; the pattern's
+    phases at t0 come in `ros`, computed on the host in float64."""
+    i = wp.tid()
+    t = t0 + float(i) * dt
+    d_s = rosette_dir_p(float(i) * dt, ros)
+    pose = sim_pose(t, motion)
+    d = wp.quat_rotate(wp.transform_get_rotation(pose), d_s)
+    hit = scene_cast(wp.transform_get_translation(pose), d, t, sc)
+    r, attr = pack_return(hit[0], hit[1], wp.uint32(first + i))
+    out_xyz[i] = d_s * r
+    out_attr[i] = attr
+    out_t[i] = t
+
+
+@wp.kernel
+def k_tls_scan(
+    stations: wp.array(dtype=wp.vec3),
+    n_az: int,
+    n_el: int,
+    el_lo: float,
+    step: float,
+    t: float,
+    noise: float,
+    sc: SimScene,
+    out: wp.array(dtype=wp.vec3),
+):
+    """One ray per (station, azimuth, elevation) of a terrestrial scanner's spherical grid, into the scene at
+    time t (where the walking sphere stands then); range noise uniform within +-noise."""
+    s, a, e = wp.tid()
+    az = float(a) * step
+    el = el_lo + float(e) * step
+    d = wp.vec3(wp.cos(el) * wp.cos(az), wp.cos(el) * wp.sin(az), wp.sin(el))
+    o = stations[s]
+    hit = scene_cast(o, d, t, sc)
+    seed = wp.uint32((s * n_az + a) * n_el + e)
+    r = hit[0] + (rand01(seed) - 0.5) * 2.0 * noise
+    out[(s * n_az + a) * n_el + e] = o + d * r
+
+
 # --------------------------------------------------------------------------------------------
 # Scenes: the room's contents as lists of primitives
 # --------------------------------------------------------------------------------------------
@@ -727,13 +779,19 @@ class SimSource:
     kind = "sim"
     dev_type = MID40
 
-    def __init__(self, rate: float = 100_000.0, device=None, motion: str = "static", scene: str = "box"):
+    def __init__(self, rate: float = 100_000.0, device=None, motion: str = "static", scene: str = "box",
+                 geometry: SceneBuilder | None = None, rosette=None):
+        """geometry: a scene of your own instead of `scene`'s (the tests build variants of one);
+        rosette: a rosette.RosetteModel to scan with instead of the built-in pattern (a fitted one makes the
+        simulator scan like that unit)."""
         self.device = wp.get_device(device)
         self.rate = rate
         self.motion = SIM_MOTIONS.index(motion)
         self.scene = SIM_SCENES.index(scene)
-        self.geometry = office_scene() if scene == "office" else box_scene()
+        self.geometry = geometry or (office_scene() if scene == "office" else box_scene())
         self._scene = self.geometry.upload(self.device)
+        self.rosette = rosette
+        self._rosette_cache = {}
         self.t = 0.0
         self.last_t0 = 0.0  # time span of the batch the last poll() / step() returned
         self.last_t1 = 0.0
@@ -760,8 +818,13 @@ class SimSource:
             self._grow(n)
         dt = 1.0 / self.rate
         self.last_t0 = self.t
-        wp.launch(k_sim_scan, dim=n, device=self.device,
-                  inputs=[self.t, dt, self.emitted, self.motion, self._scene, self.xyz, self.attr, self.tt])
+        if self.rosette is None:
+            wp.launch(k_sim_scan, dim=n, device=self.device,
+                      inputs=[self.t, dt, self.emitted, self.motion, self._scene, self.xyz, self.attr, self.tt])
+        else:
+            ros = self.rosette.gpu_params(self.t, self.t + n * dt, self.device, self._rosette_cache)
+            wp.launch(k_sim_scan_rosette, dim=n, device=self.device,
+                      inputs=[self.t, dt, self.emitted, self.motion, self._scene, ros, self.xyz, self.attr, self.tt])
         self.t += n * dt
         self.last_t1 = self.t - dt
         self.emitted += n
@@ -816,3 +879,21 @@ class SimSource:
 
     def close(self):
         pass
+
+
+def tls_scan(geometry: SceneBuilder, stations, t: float = 0.0, step_deg: float = 0.2,
+             elevation_deg: tuple = (-60.0, 89.0), noise: float = 0.002, device=None) -> np.ndarray:
+    """A terrestrial scanner's capture of a scene: a spherical grid of rays (step_deg apart, over the elevation
+    range) from each station, at time t (the walking sphere stands where it is then). World points (n, 3); rays
+    that left every surface are dropped. With prior_map.from_points this is a simulated prior map."""
+    d = wp.get_device(device)
+    sc = geometry.upload(d)
+    st = np.asarray(stations, dtype=np.float32).reshape(-1, 3)
+    n_az = int(round(360.0 / step_deg))
+    n_el = int((elevation_deg[1] - elevation_deg[0]) / step_deg) + 1
+    out = wp.empty(len(st) * n_az * n_el, dtype=wp.vec3, device=d)
+    wp.launch(k_tls_scan, dim=(len(st), n_az, n_el), device=d,
+              inputs=[wp.array(st, dtype=wp.vec3, device=d), n_az, n_el, math.radians(elevation_deg[0]),
+                      math.radians(step_deg), float(t), float(noise), sc, out])
+    pts = out.numpy()
+    return pts[np.all(np.isfinite(pts), axis=1) & (np.abs(pts).max(axis=1) < 1.0e3)]

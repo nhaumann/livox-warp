@@ -34,7 +34,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 
 from livox_warp import gpu  # noqa: E402
-from livox_warp.sources import ReplaySource  # noqa: E402
+from livox_warp.prior_map import from_points  # noqa: E402
+from livox_warp.sources import (  # noqa: E402
+    ReplaySource,
+    SceneBuilder,
+    SimSource,
+    clean_returns,
+    office_scene,
+    tls_scan,
+)
 
 wp.config.quiet = True
 wp.init()
@@ -195,6 +203,76 @@ def pose_diff(A: np.ndarray, B: np.ndarray) -> tuple[float, float]:
     """(metres, degrees) from pose A to pose B (4x4)."""
     d = np.linalg.inv(A) @ B
     return float(np.linalg.norm(d[:3, 3])), rot_angle(d[:3, :3])
+
+
+# ---- simulated changes: a prior scan and a walk that disagree (the solvers' tests) -------------------
+
+# A terrestrial scanner's stations in the office (world metres; the sensor walks at z ~ 0, the floor is at -1.3).
+TLS_STATIONS = ((1.0, 0.5, 0.2), (5.0, 2.6, 0.2), (8.5, -1.5, 0.2), (12.5, 1.2, 0.2))
+# Boxes (x0, x1, y0, y1, h0, h1 above the floor) in view of the walk and clear of it: one only in the prior scan
+# (since removed), one only in the walk (since added). The scan also caught the walking sphere where it stood at
+# t = 0; in the walk it moves.
+REMOVED_BOX = (3.2, 3.9, 2.9, 3.6, 0.0, 1.1)
+ADDED_BOX = (7.1, 7.7, -2.6, -2.0, 0.0, 1.2)
+
+
+def office_with(*boxes) -> SceneBuilder:
+    """The office scene plus some boxes."""
+    s = office_scene()
+    for b in boxes:
+        s.box(*b, 45.0)
+    return s
+
+
+def sim_prior_map(dev, step_deg: float = 0.2) -> dict:
+    """A prior map of the office as it was: a simulated terrestrial scan (with REMOVED_BOX), voxelised like an E57."""
+    pts = tls_scan(office_with(REMOVED_BOX), TLS_STATIONS, t=0.0, step_deg=step_deg, device=dev)
+    return from_points(pts, device=dev, stations=TLS_STATIONS)
+
+
+def sim_walk(dev, seconds: float, geometry: SceneBuilder | None = None, rosette=None, batch: int = 20000):
+    """The simulated walk through the office as it is now (with ADDED_BOX): (sim, xyz, attr, t) of the clean
+    returns, t float64 (the sim's own float32 times, which its poses use)."""
+    sim = SimSource(device=dev, motion="walk", scene="office", geometry=geometry or office_with(ADDED_BOX),
+                    rosette=rosette)
+    xs, ats, ts = [], [], []
+    for _ in range(int(seconds * sim.rate / batch)):
+        x, a, t, n = sim.step(batch)
+        xs.append(x.numpy()[:n].copy())
+        ats.append(a.numpy()[:n].copy())
+        ts.append(t.numpy()[:n].copy())
+    x, a, t = np.concatenate(xs), np.concatenate(ats), np.concatenate(ts).astype(np.float64)
+    keep = clean_returns(x, a)
+    return sim, x[keep], a[keep], t[keep]
+
+
+def box_distance(pts: np.ndarray, box) -> np.ndarray:
+    """Distance of world points to a SceneBuilder.box's solid (0 inside)."""
+    from livox_warp.sources import SIM_FLOOR_Z
+
+    lo = np.array([box[0], box[2], SIM_FLOOR_Z + box[4]])
+    hi = np.array([box[1], box[3], SIM_FLOOR_Z + box[5]])
+    return np.linalg.norm(np.maximum(np.maximum(lo - pts, pts - hi), 0.0), axis=1)
+
+
+def drifted(T: np.ndarray, t: np.ndarray, metres: float, degrees: float) -> np.ndarray:
+    """Poses (n, 4, 4) at times t moved by a smooth drift of up to `metres` and `degrees` (left-multiplied)."""
+    out = T.copy()
+    for i, ti in enumerate(t):
+        a = 0.5 * (1.0 - math.cos(math.pi * min(ti / 10.0, 1.0)))  # grows over the first 10 s
+        axis = np.array([0.2 * math.sin(0.3 * ti), 0.3 * math.cos(0.2 * ti), 1.0])
+        D = np.eye(4)
+        D[:3, :3] = Rotation.from_rotvec(axis / np.linalg.norm(axis) * math.radians(degrees) * a).as_matrix()
+        D[:3, 3] = metres * a * np.array([math.cos(0.25 * ti), math.sin(0.25 * ti), 0.3])
+        out[i] = D @ T[i]
+    return out
+
+
+def traj_errors(est: np.ndarray, gt: np.ndarray) -> tuple[float, float]:
+    """rms position (m) and rotation (deg) error between two pose sequences."""
+    e_t = np.linalg.norm(est[:, :3, 3] - gt[:, :3, 3], axis=1)
+    e_r = np.array([rot_angle(a[:3, :3].T @ b[:3, :3]) for a, b in zip(est, gt)])
+    return float(np.sqrt(np.mean(e_t**2))), float(np.sqrt(np.mean(e_r**2)))
 
 
 # ---- recordings and sessions ----------------------------------------------------------------------

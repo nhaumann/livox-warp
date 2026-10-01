@@ -23,6 +23,8 @@ imgui.ini
 /recordings/*.lvxr
 /maps/
 /firmware/
+# Solver outputs (python -m livox_warp.refine --out, tests/check_refine.py)
+/out/
 
 # Editor and tool state
 /.blender-toolkit/

@@ -1,14 +1,18 @@
 """Prior maps: a previously captured scan of the area (E57), cached as a compact .npz.
 
     python -m livox_warp.prior_map convert scan.e57 --voxel 0.02      # -> maps/scan_20mm.npz
+    python -m livox_warp.prior_map stations maps/scan_20mm.npz [--e57 scan.e57]   # add the scanner stations
 
 The module provides
   - convert(): reads every scan of the E57 in its world pose, voxel-downsamples on the GPU
     (voxel_downsample(): sums relative to each voxel's centre, so float32 stays exact at any extent;
     mean colour and intensity are kept) and adds a PCA normal and a planarity per point from the
     neighbours within `normal_radius` (normals());
-  - load(): the cache as a dict of arrays (xyz, normal, planarity, rgb, intensity, count, voxel,
-    normal_radius, source), in a second instead of the minutes and many GB a full E57 read takes.
+  - load(): the cache as a dict of its arrays (xyz, normal, planarity, rgb, intensity, count, voxel,
+    normal_radius, source, stations), in a second instead of the minutes and many GB a full E57 read takes;
+  - stations: each scan's scanner position, from the E57's scan headers, or estimated from the point density
+    when the E57 is one merged scan (estimate_stations). occupancy.py needs them to tell a surface that is new
+    from one the scan never saw; add them to an older cache with the `stations` command.
 
 GPU queries against a loaded map (nearest point, distance field) are mapgrid.PriorGrid's.
 """
@@ -222,6 +226,7 @@ def convert(e57_path: str, out_path: str, voxel: float = 0.02, normal_radius: fl
 
     t0 = time.time()
     e = pye57.E57(e57_path)
+    stations = e57_stations(e)
     xs, ins, cs = [], [], []
     total = 0
     for i in range(e.scan_count):
@@ -256,14 +261,112 @@ def convert(e57_path: str, out_path: str, voxel: float = 0.02, normal_radius: fl
     np.savez_compressed(out_path, xyz=vx.astype(np.float32), normal=nrm.astype(np.float16),
                         planarity=planar.astype(np.float16), rgb=rgb8, intensity=vi.astype(np.float32),
                         count=np.minimum(vn, 65535).astype(np.uint16), voxel=np.float32(voxel),
-                        normal_radius=np.float32(normal_radius), source=os.path.basename(e57_path))
+                        normal_radius=np.float32(normal_radius), source=os.path.basename(e57_path), stations=stations)
     log(f"wrote {out_path} ({os.path.getsize(out_path) / 2**20:.0f} MiB) in {time.time() - t0:.0f} s total")
+
+
+def e57_stations(e) -> np.ndarray:
+    """(n_scans, 3) scanner positions from the scan headers of a pye57.E57 (their poses' translations)."""
+    out = []
+    for i in range(e.scan_count):
+        tr = getattr(e.get_header(i), "translation", None)
+        if tr is not None:
+            out.append(np.asarray(tr, dtype=np.float64).reshape(3))
+    return np.array(out, np.float32).reshape(-1, 3)
+
+
+def estimate_stations(pm: dict, height: float = 1.5, cell: float = 0.1, smooth: float = 0.25, min_sep: float = 2.0,
+                      rel: float = 0.1, column: float = 1.5) -> np.ndarray:
+    """Where a terrestrial scanner stood, from a cache whose E57 kept no station poses (one merged scan).
+
+    A scanner samples a fixed angular grid, so the raw points per voxel (the cache's `count`) fall off as
+    cos(incidence) / distance^2: on the floor beneath a station and the ceiling above it they peak. The mean count
+    per horizontal voxel in 10 cm columns, smoothed, has a local maximum over every station (at least min_sep
+    apart, above `rel` of the strongest). Its height: the densest horizontal level within `column` metres is the
+    floor or the ceiling, whichever is nearer; with surfaces 1.8-4 m below it, it is the ceiling and the lowest of
+    them the floor (a desk top is not); the station stood `height` above the floor, inside the room. (The column
+    is wide because a scanner cannot see the cone below its tripod: no floor lies near the point beneath it.)"""
+    from scipy import ndimage
+
+    xyz = np.asarray(pm["xyz"], np.float64)
+    nz = np.abs(np.asarray(pm["normal"], np.float64)[:, 2])
+    pl = np.asarray(pm.get("planarity", np.ones(len(xyz))), np.float32)
+    cnt = np.asarray(pm["count"], np.float64)
+    horiz = (nz > 0.97) & (pl > 0.5)
+    p, c = xyz[horiz], cnt[horiz]
+    if len(p) < 100:
+        return np.zeros((0, 3), np.float32)
+    lo = p[:, :2].min(0)
+    ij = np.floor((p[:, :2] - lo) / cell).astype(np.int64)
+    dims = ij.max(0) + 1
+    total = np.zeros(dims)
+    area = np.zeros(dims)
+    np.add.at(total, (ij[:, 0], ij[:, 1]), c)
+    np.add.at(area, (ij[:, 0], ij[:, 1]), 1.0)
+    s = smooth / cell
+    dens = ndimage.gaussian_filter(total, s) / np.maximum(ndimage.gaussian_filter(area, s), 1e-6)
+    dens[ndimage.gaussian_filter(area, s) < 0.3] = 0.0  # no horizontal surface around: no station to place
+    size = int(2 * round(min_sep / cell / 2) + 1)
+    peaks = (dens == ndimage.maximum_filter(dens, size=size)) & (dens > rel * dens.max())
+    out = []
+    for i, j in zip(*np.nonzero(peaks)):
+        centre = lo + (np.array([i, j]) + 0.5) * cell
+        col = np.linalg.norm(p[:, :2] - centre, axis=1) < column
+        if col.sum() < 10:
+            continue
+        zs, cs = p[col, 2], c[col]
+        bins = np.floor(zs / 0.05).astype(np.int64)
+        levels = {}
+        for b in np.unique(bins):
+            m = bins == b
+            levels[b] = (float(np.median(zs[m])), float(cs[m].mean()), int(m.sum()))
+        ordered = [v for v in sorted(levels.values(), key=lambda v: v[0]) if v[2] >= 20]  # surfaces, not clutter
+        if not ordered:
+            continue
+        nearest = max(ordered, key=lambda v: v[1])  # the densest: the floor or the ceiling, whichever is nearer
+        below = [v for v in ordered if 1.8 <= nearest[0] - v[0] <= 4.0]
+        floor = below[0][0] if below else nearest[0]  # under a ceiling, the lowest surface (not a desk) is the floor
+        ceiling = min([v[0] for v in ordered if v[0] - floor >= 1.8] or [floor + 2.5])
+        out.append((centre[0], centre[1], min(floor + height, ceiling - 0.2)))
+    return np.array(out, np.float32).reshape(-1, 3)
+
+
+def add_stations(e57_path: str | None, npz_path: str, log=print):
+    """Write scanner stations into an existing cache: from the E57's scan headers (seconds, not minutes), or, with
+    no E57 or one whose scans carry no poses (one merged scan), estimated from the cache (estimate_stations)."""
+    z = dict(np.load(npz_path))
+    st = np.zeros((0, 3), np.float32)
+    if e57_path:
+        import pye57
+
+        st = e57_stations(pye57.E57(e57_path))
+        st = st[np.linalg.norm(st, axis=1) > 0]  # a merged scan's single header sits at the origin
+    how = f"from {os.path.basename(e57_path)}" if len(st) else "estimated from the scan's point density"
+    if not len(st):
+        st = estimate_stations(z)
+    z["stations"] = st
+    np.savez_compressed(npz_path, **z)
+    log(f"{npz_path}: {len(st)} stations {how}")
 
 
 def load(path: str) -> dict:
     """A cache written by convert(), as a dict of its arrays."""
     z = np.load(path)
     return {k: z[k] for k in z.files}
+
+
+def from_points(xyz: np.ndarray, voxel: float = 0.02, normal_radius: float = 0.08, device=None,
+                slots_log2: int = 24, stations=None) -> dict:
+    """A prior map from a world point cloud, the way convert() makes one from an E57 (voxel means, normals,
+    planarity, the stations if given; no colour). The tests build simulated prior maps with it from
+    sources.tls_scan."""
+    n = len(xyz)
+    vx, _, _, vn = voxel_downsample(np.asarray(xyz, dtype=np.float32), np.zeros(n, np.float32),
+                                    np.zeros((n, 3), np.float32), voxel, device, slots_log2=slots_log2)
+    nrm, planar = normals(vx, normal_radius, device)
+    return {"xyz": vx.astype(np.float32), "normal": nrm.astype(np.float32), "planarity": planar.astype(np.float32),
+            "count": vn, "voxel": np.float32(voxel), "normal_radius": np.float32(normal_radius),
+            "stations": np.zeros((0, 3), np.float32) if stations is None else np.asarray(stations, np.float32)}
 
 
 def main(argv=None):
@@ -274,7 +377,15 @@ def main(argv=None):
     c.add_argument("--voxel", type=float, default=0.02, help="voxel size in m (default: %(default)s)")
     c.add_argument("--normal-radius", type=float, default=0.08, help="neighbourhood radius in m for the normals")
     c.add_argument("--out", default=None, help="output .npz (default: maps/<e57 name>_<voxel mm>mm.npz)")
+    st = sub.add_parser("stations", help="add scanner stations to an existing .npz cache: from the E57's scan "
+                                         "headers, or estimated from the cache when it has none")
+    st.add_argument("npz")
+    st.add_argument("--e57", help="the E57 the cache was made from (its scan poses); without one, or with a "
+                                  "merged scan, the stations are estimated")
     a = p.parse_args(argv)
+    if a.cmd == "stations":
+        add_stations(a.e57, a.npz)
+        return
     wp.config.quiet = True
     wp.init()
     if a.cmd == "convert":
